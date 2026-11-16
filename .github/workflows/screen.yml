@@ -8,6 +8,7 @@ on:
     paths:
       - "screener.py"
       - "config.json"
+      - "trigger/**"
       - ".github/workflows/**"
 
 permissions:
