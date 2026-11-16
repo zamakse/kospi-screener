@@ -18,7 +18,7 @@ import requests
 CONFIG = {
     "연속_음봉_최소": 6,              # 최근 봉부터 연속 음봉이 이 개수 이상
     "누적등락률_상한_퍼센트": 0,      # 연속 구간 누적 등락률이 이 값 미만인 종목만 (null 이면 미적용)
-    "거래대금_하한_원": 1_000_000_000,  # 미만이면 '저유동성'으로 분리
+    "평균거래대금_하한_원": 3_000_000_000,  # 최근 20거래일 평균 거래대금이 이 값 미만이면 '저유동성'으로 분리
     "구간_봉수": 10,                  # 누적 음봉: 최근 N개 봉 중
     "구간_음봉_최소": None,           # 음봉이 K개 이상 (null 이면 누적 음봉 검색 끔)
 }
@@ -27,7 +27,8 @@ if _cfg.exists():
     CONFIG.update(json.loads(_cfg.read_text(encoding="utf-8")))
 THRESHOLD = int(CONFIG["연속_음봉_최소"])
 MAX_DROP = CONFIG["누적등락률_상한_퍼센트"]
-MIN_TRADING_VALUE = int(CONFIG["거래대금_하한_원"])
+MIN_TRADING_VALUE = int(CONFIG["평균거래대금_하한_원"])
+AVG_DAYS = 20
 WINDOW = int(CONFIG["구간_봉수"])
 WINDOW_MIN = CONFIG["구간_음봉_최소"]
 DAYS = 90                          # 종목당 가져올 일봉 수 (주봉 약 18개 분량)
@@ -201,8 +202,11 @@ def main():
             continue
         info = targets[code]
         tv = int(bars[-1]["close"] * bars[-1]["volume"])
-        common = {"code": code, "name": info["name"], "trading_value": tv,
-                  "market_cap": info["market_cap"], "low_liquidity": tv < MIN_TRADING_VALUE}
+        # 평소 거래대금: 오늘을 뺀 최근 20거래일 평균 (거래정지일 제외)
+        hist = [b["close"] * b["volume"] for b in bars[:-1] if b["volume"] > 0][-AVG_DAYS:]
+        avg_tv = int(sum(hist) / len(hist)) if hist else 0
+        common = {"code": code, "name": info["name"], "trading_value": tv, "avg_trading_value": avg_tv,
+                  "market_cap": info["market_cap"], "low_liquidity": avg_tv < MIN_TRADING_VALUE}
         for dest, dest_win, series in ((daily, daily_win, bars), (weekly, weekly_win, to_weekly(bars))):
             cnt, wlen, wdrop = bearish_in_window(series, WINDOW)
             n = bearish_streak(series)
@@ -216,10 +220,10 @@ def main():
                 dest_win.append({**common, "bearish_in_window": cnt, "window": WINDOW, "streak": n,
                                  "drop_pct": wdrop, "close": series[-1]["close"]})
 
-    key = lambda r: (r["low_liquidity"], -r["streak"], -r["trading_value"])
+    key = lambda r: (r["low_liquidity"], -r["streak"], r["drop_pct"] if r["drop_pct"] is not None else 0)
     daily.sort(key=key)
     weekly.sort(key=key)
-    wkey = lambda r: (r["low_liquidity"], -r["bearish_in_window"], -r["trading_value"])
+    wkey = lambda r: (r["low_liquidity"], -r["bearish_in_window"], -r["avg_trading_value"])
     daily_win.sort(key=wkey)
     weekly_win.sort(key=wkey)
 
@@ -258,16 +262,16 @@ def to_markdown(r):
     lines = [f"# 코스피 연속 음봉 {r['threshold']}개 이상 — {r['market_date']}", "",
              f"생성 {r['generated_at']} · 대상 {r['universe_count']}종목, 수집 실패 {r['failed_count']}, 거래정지 제외 {r['skipped_suspended']}, 누적등락률 조건으로 제외 {r['excluded_by_drop_filter']}", ""]
     for title, key in (("일봉", "daily"), ("주봉", "weekly")):
-        lines += [f"## {title} ({len(r[key])}종목)", "", "| 종목 | 코드 | 연속 | 시작일 | 누적등락 | 종가 | 거래대금(억) | 비고 |", "|---|---|---|---|---|---|---|---|"]
+        lines += [f"## {title} ({len(r[key])}종목)", "", "| 종목 | 코드 | 연속 | 시작일 | 누적등락 | 종가 | 20일평균 거래대금(억) | 오늘 거래대금(억) | 비고 |", "|---|---|---|---|---|---|---|---|---|"]
         for x in r[key]:
-            lines.append(f"| {x['name']} | {x['code']} | {x['streak']}{'+' if x['capped'] else ''} | {fmt_date(x['start_date'])} | {x['drop_pct']}% | {x['close']:,.0f} | {x['trading_value'] / 1e8:,.0f} | {'저유동성' if x['low_liquidity'] else ''} |")
+            lines.append(f"| {x['name']} | {x['code']} | {x['streak']}{'+' if x['capped'] else ''} | {fmt_date(x['start_date'])} | {x['drop_pct']}% | {x['close']:,.0f} | {x['avg_trading_value'] / 1e8:,.0f} | {x['trading_value'] / 1e8:,.0f} | {'저유동성' if x['low_liquidity'] else ''} |")
         lines.append("")
     if r["config"]["구간_음봉_최소"] is not None:
         for title, key in (("일봉", "daily_window"), ("주봉", "weekly_window")):
             lines += [f"## 누적 음봉 {title}: 최근 {r['config']['구간_봉수']}봉 중 {r['config']['구간_음봉_최소']}개 이상 ({len(r[key])}종목)", "",
-                      "| 종목 | 코드 | 음봉 수 | 현재 연속 | 구간 등락 | 종가 | 거래대금(억) | 비고 |", "|---|---|---|---|---|---|---|---|"]
+                      "| 종목 | 코드 | 음봉 수 | 현재 연속 | 구간 등락 | 종가 | 20일평균 거래대금(억) | 비고 |", "|---|---|---|---|---|---|---|---|"]
             for x in r[key]:
-                lines.append(f"| {x['name']} | {x['code']} | {x['bearish_in_window']}/{x['window']} | {x['streak']} | {x['drop_pct']}% | {x['close']:,.0f} | {x['trading_value'] / 1e8:,.0f} | {'저유동성' if x['low_liquidity'] else ''} |")
+                lines.append(f"| {x['name']} | {x['code']} | {x['bearish_in_window']}/{x['window']} | {x['streak']} | {x['drop_pct']}% | {x['close']:,.0f} | {x['avg_trading_value'] / 1e8:,.0f} | {'저유동성' if x['low_liquidity'] else ''} |")
             lines.append("")
     return "\n".join(lines)
 
