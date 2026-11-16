@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: "20 11 * * 1-5"   # 평일 20:20 KST
   workflow_dispatch:
+  push:
+    paths:
+      - "screener.py"
+      - ".github/workflows/**"
 
 permissions:
   contents: write
@@ -18,8 +22,14 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests
-      - run: python screener.py
+      - name: Run screener
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p results
+          python screener.py 2>&1 | tee results/run.log
       - name: Commit results
+        if: always()
         run: |
           git config user.name "kospi-screener"
           git config user.email "actions@users.noreply.github.com"
