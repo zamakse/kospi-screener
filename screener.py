@@ -14,8 +14,22 @@ from pathlib import Path
 
 import requests
 
-THRESHOLD = 6                      # 연속 음봉 최소 개수
-MIN_TRADING_VALUE = 1_000_000_000  # 이 금액(원) 미만 거래대금은 '저유동성'으로 분리
+# 조건은 config.json 에서 바꿉니다 (아래는 파일이 없을 때의 기본값)
+CONFIG = {
+    "연속_음봉_최소": 6,              # 최근 봉부터 연속 음봉이 이 개수 이상
+    "누적등락률_상한_퍼센트": 0,      # 연속 구간 누적 등락률이 이 값 미만인 종목만 (null 이면 미적용)
+    "거래대금_하한_원": 1_000_000_000,  # 미만이면 '저유동성'으로 분리
+    "구간_봉수": 10,                  # 누적 음봉: 최근 N개 봉 중
+    "구간_음봉_최소": None,           # 음봉이 K개 이상 (null 이면 누적 음봉 검색 끔)
+}
+_cfg = Path(__file__).parent / "config.json"
+if _cfg.exists():
+    CONFIG.update(json.loads(_cfg.read_text(encoding="utf-8")))
+THRESHOLD = int(CONFIG["연속_음봉_최소"])
+MAX_DROP = CONFIG["누적등락률_상한_퍼센트"]
+MIN_TRADING_VALUE = int(CONFIG["거래대금_하한_원"])
+WINDOW = int(CONFIG["구간_봉수"])
+WINDOW_MIN = CONFIG["구간_음봉_최소"]
 DAYS = 90                          # 종목당 가져올 일봉 수 (주봉 약 18개 분량)
 WORKERS = 8
 EXCLUDE_NAME = re.compile(r"스팩|리츠|인프라|맥쿼리|ETN|ETF")
@@ -134,6 +148,16 @@ def bearish_streak(bars):
     return n
 
 
+def bearish_in_window(bars, window):
+    """최근 window개 봉 중 음봉 수(연속 여부 무관)와 그 구간 누적 등락률."""
+    w = [b for b in bars if b["volume"] > 0][-window:]
+    cnt = sum(1 for b in w if b["close"] < b["open"])
+    prev = [b for b in bars if b["volume"] > 0][-window - 1:-window]
+    base = prev[0]["close"] if prev else (w[0]["open"] if w else None)
+    drop = round((w[-1]["close"] / base - 1) * 100, 2) if w and base else None
+    return cnt, len(w), drop
+
+
 def describe(bars, n):
     first = bars[-n]
     base = bars[-n - 1]["close"] if len(bars) > n else first["open"]
@@ -166,7 +190,8 @@ def main():
     with ThreadPoolExecutor(WORKERS) as ex:
         rows = list(ex.map(work, targets))
 
-    daily, weekly, failed, stale = [], [], [], 0
+    daily, weekly, daily_win, weekly_win, failed, stale = [], [], [], [], [], 0
+    filtered_by_drop = 0
     for code, bars, err in rows:
         if err or not bars:
             failed.append(code)
@@ -178,14 +203,25 @@ def main():
         tv = int(bars[-1]["close"] * bars[-1]["volume"])
         common = {"code": code, "name": info["name"], "trading_value": tv,
                   "market_cap": info["market_cap"], "low_liquidity": tv < MIN_TRADING_VALUE}
-        for dest, series in ((daily, bars), (weekly, to_weekly(bars))):
+        for dest, dest_win, series in ((daily, daily_win, bars), (weekly, weekly_win, to_weekly(bars))):
+            cnt, wlen, wdrop = bearish_in_window(series, WINDOW)
             n = bearish_streak(series)
             if n >= THRESHOLD:
-                dest.append({**common, **describe(series, n)})
+                d = describe(series, n)
+                if MAX_DROP is not None and d["drop_pct"] is not None and d["drop_pct"] >= MAX_DROP:
+                    filtered_by_drop += 1
+                else:
+                    dest.append({**common, **d, "bearish_in_window": cnt})
+            if WINDOW_MIN is not None and wlen == WINDOW and cnt >= int(WINDOW_MIN):
+                dest_win.append({**common, "bearish_in_window": cnt, "window": WINDOW, "streak": n,
+                                 "drop_pct": wdrop, "close": series[-1]["close"]})
 
     key = lambda r: (r["low_liquidity"], -r["streak"], -r["trading_value"])
     daily.sort(key=key)
     weekly.sort(key=key)
+    wkey = lambda r: (r["low_liquidity"], -r["bearish_in_window"], -r["trading_value"])
+    daily_win.sort(key=wkey)
+    weekly_win.sort(key=wkey)
 
     if len(failed) > len(targets) * 0.2:
         raise RuntimeError(f"시세 수집 실패 {len(failed)}/{len(targets)}건 — 결과를 신뢰할 수 없어 중단")
@@ -195,6 +231,8 @@ def main():
         "market_date": fmt_date(market_date),
         "is_today": fmt_date(market_date) == now.strftime("%Y-%m-%d"),
         "threshold": THRESHOLD,
+        "config": CONFIG,
+        "excluded_by_drop_filter": filtered_by_drop,
         "basis": "네이버 금융 일봉 (KRX 정규장 종가, 수정주가). NXT 시간외 미반영. 주봉은 일봉을 주 단위로 묶어 계산하며 마지막 봉은 진행 중인 이번 주",
         "min_trading_value": MIN_TRADING_VALUE,
         "listing_source": source,
@@ -203,6 +241,8 @@ def main():
         "failed_count": len(failed),
         "daily": daily,
         "weekly": weekly,
+        "daily_window": daily_win,
+        "weekly_window": weekly_win,
     }
 
     out = Path(__file__).parent / "results"
@@ -216,12 +256,19 @@ def main():
 
 def to_markdown(r):
     lines = [f"# 코스피 연속 음봉 {r['threshold']}개 이상 — {r['market_date']}", "",
-             f"대상 {r['universe_count']}종목, 수집 실패 {r['failed_count']}, 거래정지 제외 {r['skipped_suspended']}", ""]
+             f"생성 {r['generated_at']} · 대상 {r['universe_count']}종목, 수집 실패 {r['failed_count']}, 거래정지 제외 {r['skipped_suspended']}, 누적등락률 조건으로 제외 {r['excluded_by_drop_filter']}", ""]
     for title, key in (("일봉", "daily"), ("주봉", "weekly")):
         lines += [f"## {title} ({len(r[key])}종목)", "", "| 종목 | 코드 | 연속 | 시작일 | 누적등락 | 종가 | 거래대금(억) | 비고 |", "|---|---|---|---|---|---|---|---|"]
         for x in r[key]:
             lines.append(f"| {x['name']} | {x['code']} | {x['streak']}{'+' if x['capped'] else ''} | {fmt_date(x['start_date'])} | {x['drop_pct']}% | {x['close']:,.0f} | {x['trading_value'] / 1e8:,.0f} | {'저유동성' if x['low_liquidity'] else ''} |")
         lines.append("")
+    if r["config"]["구간_음봉_최소"] is not None:
+        for title, key in (("일봉", "daily_window"), ("주봉", "weekly_window")):
+            lines += [f"## 누적 음봉 {title}: 최근 {r['config']['구간_봉수']}봉 중 {r['config']['구간_음봉_최소']}개 이상 ({len(r[key])}종목)", "",
+                      "| 종목 | 코드 | 음봉 수 | 현재 연속 | 구간 등락 | 종가 | 거래대금(억) | 비고 |", "|---|---|---|---|---|---|---|---|"]
+            for x in r[key]:
+                lines.append(f"| {x['name']} | {x['code']} | {x['bearish_in_window']}/{x['window']} | {x['streak']} | {x['drop_pct']}% | {x['close']:,.0f} | {x['trading_value'] / 1e8:,.0f} | {'저유동성' if x['low_liquidity'] else ''} |")
+            lines.append("")
     return "\n".join(lines)
 
 
