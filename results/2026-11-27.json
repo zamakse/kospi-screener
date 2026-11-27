@@ -1,7 +1,7 @@
 {
- "generated_at": "2026-11-27T20:11:23+09:00",
+ "generated_at": "2026-11-28T05:02:06+09:00",
  "market_date": "2026-11-27",
- "is_today": true,
+ "is_today": false,
  "threshold": 6,
  "config": {
   "연속_음봉_최소": 6,
